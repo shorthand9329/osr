@@ -1,0 +1,303 @@
+name: r-mac (macOS browser SSH)
+
+# On-demand, ephemeral macOS runner reachable only through a Cloudflare named
+# tunnel fronted by Cloudflare Access browser SSH.
+# The runner opens no inbound ports: cloudflared dials out to the Cloudflare
+# edge. Cloudflare Access signs a short-lived SSH certificate for the signed-in
+# user's email prefix; sshd trusts that CA instead of long-lived authorized_keys.
+#
+# Trigger: workflow_dispatch only (from the SSO portal).
+# Secrets (bound by repo admin, never committed):
+#   CF_TUNNEL_TOKEN_R_MAC  - named tunnel token for r-mac
+#   CF_CA_R_MAC            - Cloudflare Access SSH CA public key
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: r-mac
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  browser-ssh:
+    name: macOS runner + cloudflared + Access CA
+    runs-on: macos-latest
+    timeout-minutes: 360
+    steps:
+      - name: Enable Remote Login (sshd)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "runner: $(hostname) / $(uname -m) / macOS $(sw_vers -productVersion)"
+          if ! sudo systemsetup -setremotelogin on; then
+            echo "::warning::systemsetup -setremotelogin failed, falling back to launchctl"
+            sudo launchctl enable system/com.openssh.sshd || echo "::warning::launchctl enable failed"
+            sudo launchctl bootstrap system /System/Library/LaunchDaemons/ssh.plist || echo "::warning::launchctl bootstrap failed (already loaded?)"
+          fi
+          sudo launchctl enable system/com.openssh.sshd || echo "::warning::launchctl enable failed"
+          sudo launchctl kickstart -k system/com.openssh.sshd || echo "::warning::launchctl kickstart failed"
+          # Generate any missing host keys (sshd -t and real logins need them).
+          sudo ssh-keygen -A
+          ready=0
+          for _ in $(seq 1 30); do
+            if nc -z 127.0.0.1 22 >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "ERROR: sshd is not listening on 127.0.0.1:22"
+            sudo lsof -nP -iTCP:22 -sTCP:LISTEN || echo "no listener on port 22"
+            exit 1
+          fi
+          echo "sshd is listening:"
+          sudo lsof -nP -iTCP:22 -sTCP:LISTEN
+
+      - name: Install Cloudflare Access CA and sshd drop-in
+        shell: bash
+        env:
+          CF_CA_R_MAC: ${{ secrets.CF_CA_R_MAC }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CF_CA_R_MAC:-}" ]; then
+            echo "ERROR: secret CF_CA_R_MAC is empty/unset"
+            exit 1
+          fi
+          ca_file=/etc/ssh/cloudflare-ca.pub
+          sudo mkdir -p /etc/ssh/sshd_config.d
+          printf '%s\n' "$CF_CA_R_MAC" | sudo tee "$ca_file" >/dev/null
+          sudo chown root:wheel "$ca_file"
+          sudo chmod 600 "$ca_file"
+          # Only this CA may authenticate users; keys are just an extra sanity check.
+          sudo ssh-keygen -lf "$ca_file"
+          # macOS sshd_config has no Include by default; add one if absent.
+          # Insert it BEFORE any Match block: an Include placed after a Match
+          # block inherits that scope, so TrustedUserCAKeys would only apply to
+          # matching connections instead of globally.
+          if ! grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*' /etc/ssh/sshd_config; then
+            sudo awk '
+              BEGIN { inserted = 0 }
+              /^[[:space:]]*Match[[:space:]]/ && !inserted { print "Include /etc/ssh/sshd_config.d/*"; inserted = 1 }
+              { print }
+              END { if (!inserted) print "Include /etc/ssh/sshd_config.d/*" }
+            ' /etc/ssh/sshd_config | sudo tee /etc/ssh/sshd_config.new >/dev/null
+            sudo chmod 644 /etc/ssh/sshd_config.new
+            sudo mv /etc/ssh/sshd_config.new /etc/ssh/sshd_config
+            echo "added Include /etc/ssh/sshd_config.d/* to /etc/ssh/sshd_config"
+          fi
+          sudo tee /etc/ssh/sshd_config.d/99-cloudflare-browser-ssh.conf >/dev/null <<'EOF'
+          PubkeyAuthentication yes
+          PasswordAuthentication no
+          TrustedUserCAKeys /etc/ssh/cloudflare-ca.pub
+          EOF
+          sudo chown root:wheel /etc/ssh/sshd_config.d/99-cloudflare-browser-ssh.conf
+          sudo chmod 644 /etc/ssh/sshd_config.d/99-cloudflare-browser-ssh.conf
+          sudo /usr/sbin/sshd -t
+          sudo launchctl kickstart -k system/com.openssh.sshd || echo "::warning::kickstart failed after config change"
+          echo "sshd config OK; Cloudflare Access CA is trusted"
+
+      - name: Create SSO users, wrapper shell and sudoers
+        shell: bash
+        env:
+          CF_ACCESS_READ_TOKEN: ${{ secrets.CF_ACCESS_READ_TOKEN }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Users are NOT hardcoded. The Cloudflare Access application policy is
+          # the source of truth: add/remove an allow-listed email in Access and
+          # the next Start picks it up, with no workflow change.
+          ACCOUNT_ID=789676de3523a78ee48c8a33287c5ad5
+          APP_ID=f62d9187-f890-4649-a2eb-50672584cffe
+          policies=$(curl -fsS --retry 3 \
+            -H "Authorization: Bearer ${CF_ACCESS_READ_TOKEN:?CF_ACCESS_READ_TOKEN secret is missing}" \
+            "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/access/apps/${APP_ID}/policies")
+          USERS_STR=$(printf '%s' "$policies" | python3 -c '
+          import json, re, sys
+          data = json.load(sys.stdin)
+          found = []
+          for policy in data.get("result") or []:
+              for inc in policy.get("include") or []:
+                  email = (inc.get("email") or {}).get("email")
+                  if not email or "@" not in email:
+                      continue
+                  prefix = email.split("@", 1)[0].strip().lower()
+                  if re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,31}", prefix):
+                      found.append(prefix)
+          print(" ".join(sorted(set(found))))
+          ')
+          if [ -z "$USERS_STR" ]; then echo "ERROR: Cloudflare Access policy returned no usable email prefixes"; exit 1; fi
+          read -r -a USERS <<< "$USERS_STR"
+          echo "users from Cloudflare Access policy: ${USERS[*]}"
+          wrapper=/usr/local/sbin/cloudflare-sso-shell
+
+          # 1. Login shell: certificate auth already proved the Access identity;
+          #    the session is handed to the single unified 'runner' account.
+          sudo install -d -m 755 /usr/local/sbin
+          sudo tee "$wrapper" >/dev/null <<'EOF'
+          #!/bin/bash
+          # Cloudflare Access browser SSH login shell: everything lands as runner.
+          exec sudo -iu runner
+          EOF
+          sudo chown root:wheel "$wrapper"
+          sudo chmod 755 "$wrapper"
+          grep -qxF "$wrapper" /etc/shells || printf '%s\n' "$wrapper" | sudo tee -a /etc/shells >/dev/null
+
+          # 2. Unix group backing the passwordless sudoers rule.
+          if ! dscl . -read /Groups/cloudflare-sso >/dev/null 2>&1; then
+            gid=650
+            while dscl . -list /Groups PrimaryGroupID | awk -v g="$gid" '$2==g{found=1} END{exit !found}'; do
+              gid=$((gid+1))
+            done
+            sudo dscl . -create /Groups/cloudflare-sso
+            sudo dscl . -create /Groups/cloudflare-sso PrimaryGroupID "$gid"
+            sudo dscl . -create /Groups/cloudflare-sso RealName "Cloudflare SSO"
+            sudo dscl . -create /Groups/cloudflare-sso Password "*"
+          fi
+
+          # 3. sudoers drop-in: certificate auth already established identity.
+          sudo install -d -m 755 /etc/sudoers.d
+          sudo tee /etc/sudoers.d/cloudflare-sso >/dev/null <<'EOF'
+          %cloudflare-sso ALL=(ALL) NOPASSWD: ALL
+          Defaults:%cloudflare-sso !requiretty
+          EOF
+          sudo chown root:wheel /etc/sudoers.d/cloudflare-sso
+          sudo chmod 440 /etc/sudoers.d/cloudflare-sso
+          sudo visudo -cf /etc/sudoers.d/cloudflare-sso
+
+          # 4. Unified 'runner' account: every browser SSH session ends up here.
+          if ! dscl . -read /Users/runner >/dev/null 2>&1; then
+            runner_uid=549
+            while dscl . -list /Users UniqueID | awk -v x="$runner_uid" '$2==x{found=1} END{exit !found}'; do
+              runner_uid=$((runner_uid+1))
+            done
+            sudo dscl . -create /Users/runner
+            sudo dscl . -create /Users/runner RealName "OS Runner"
+            sudo dscl . -create /Users/runner UniqueID "$runner_uid"
+            sudo dscl . -create /Users/runner PrimaryGroupID 20
+            sudo dscl . -create /Users/runner NFSHomeDirectory /Users/runner
+            sudo dscl . -passwd /Users/runner "$RDP_PASSWORD"
+            sudo createhomedir -c -u runner >/dev/null
+            echo "created unified runner user (uid $runner_uid)"
+          fi
+          sudo dscl . -create /Users/runner UserShell /bin/bash
+          if ! sudo dsmemberutil checkmembership -U runner -G cloudflare-sso | grep -q ' is a member'; then
+            sudo dseditgroup -o edit -a runner -t user cloudflare-sso
+          fi
+          id runner
+
+          # 5. One macOS user per allowed Cloudflare Access email prefix. The
+          #    Access certificate principal must be the local UNIX username;
+          #    their shell immediately becomes the unified runner session.
+          next_uid=550
+          for u in "${USERS[@]}"; do
+            while dscl . -list /Users UniqueID | awk -v x="$next_uid" '$2==x{found=1} END{exit !found}'; do
+              next_uid=$((next_uid+1))
+            done
+            uid=$next_uid
+            next_uid=$((next_uid+1))
+
+            if dscl . -read "/Users/$u" >/dev/null 2>&1; then
+              echo "user $u already exists, updating attributes"
+            else
+              sudo dscl . -create "/Users/$u"
+              sudo dscl . -create "/Users/$u" RealName "Cloudflare SSO $u"
+              sudo dscl . -create "/Users/$u" UniqueID "$uid"
+              sudo dscl . -create "/Users/$u" PrimaryGroupID 20
+              sudo dscl . -create "/Users/$u" NFSHomeDirectory "/Users/$u"
+              # Random throwaway password: logins are certificate-only.
+              pw="$(openssl rand -base64 18)"
+              sudo dscl . -passwd "/Users/$u" "$pw"
+              unset pw
+              sudo createhomedir -c -u "$u" >/dev/null
+              echo "created user $u (uid $uid)"
+            fi
+            sudo dscl . -create "/Users/$u" UserShell "$wrapper"
+            if ! sudo dsmemberutil checkmembership -U "$u" -G admin | grep -q ' is a member'; then
+              sudo dseditgroup -o edit -a "$u" -t user admin
+            fi
+            if ! sudo dsmemberutil checkmembership -U "$u" -G cloudflare-sso | grep -q ' is a member'; then
+              sudo dseditgroup -o edit -a "$u" -t user cloudflare-sso
+            fi
+            # Verification: fail loudly if anything above silently did nothing.
+            id "$u"
+            sudo dscl . -read "/Users/$u" UserShell
+            sudo dsmemberutil checkmembership -U "$u" -G cloudflare-sso
+          done
+
+      - name: Install cloudflared
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            arm64) cf_arch=darwin-arm64 ;;
+            x86_64) cf_arch=darwin-amd64 ;;
+            *) echo "ERROR: unsupported runner architecture: $(uname -m)"; exit 1 ;;
+          esac
+          url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${cf_arch}.tgz"
+          echo "downloading $url"
+          curl -fsSL --retry 5 --retry-delay 5 -o /tmp/cloudflared.tgz "$url"
+          sudo tar -xzf /tmp/cloudflared.tgz -C /usr/local/bin cloudflared
+          sudo chown root:wheel /usr/local/bin/cloudflared
+          sudo chmod 755 /usr/local/bin/cloudflared
+          /usr/local/bin/cloudflared --version
+
+      - name: Start Cloudflare tunnel and wait for registration
+        shell: bash
+        env:
+          CF_TUNNEL_TOKEN_R_MAC: ${{ secrets.CF_TUNNEL_TOKEN_R_MAC }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CF_TUNNEL_TOKEN_R_MAC:-}" ]; then
+            echo "ERROR: secret CF_TUNNEL_TOKEN_R_MAC is empty/unset"
+            exit 1
+          fi
+          log=/tmp/cloudflared.log
+          : > "$log"
+          nohup /usr/local/bin/cloudflared tunnel run --token "$CF_TUNNEL_TOKEN_R_MAC" >"$log" 2>&1 &
+          pid=$!
+          disown 2>/dev/null || true
+          echo "$pid" > /tmp/cloudflared.pid
+          echo "cloudflared started (pid $pid)"
+          registered=0
+          for _ in $(seq 1 60); do
+            if grep -q 'Registered tunnel connection' "$log" 2>/dev/null; then
+              registered=1
+              break
+            fi
+            if ! kill -0 "$pid" 2>/dev/null; then
+              echo "ERROR: cloudflared exited before registering"
+              break
+            fi
+            sleep 2
+          done
+          echo "---- cloudflared log (tail) ----"
+          tail -n 30 "$log" || echo "no log yet"
+          if [ "$registered" -ne 1 ]; then
+            echo "ERROR: tunnel did not report 'Registered tunnel connection' within 120s"
+            exit 1
+          fi
+          grep 'Registered tunnel connection' "$log" | tail -n 3
+
+      - name: Readiness summary and keep alive (up to 6h)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "==================== r-mac READY ===================="
+          echo "runner   : $(hostname) ($(uname -m)) macOS $(sw_vers -productVersion)"
+          echo "sshd     :"
+          sudo lsof -nP -iTCP:22 -sTCP:LISTEN || echo "WARNING: sshd not listening"
+          echo "ca       :"
+          sudo ls -l /etc/ssh/cloudflare-ca.pub
+          sudo ssh-keygen -lf /etc/ssh/cloudflare-ca.pub
+          echo "users    :"
+          sudo dscl . -read /Groups/cloudflare-sso GroupMembership || echo "no cloudflare-sso members yet"
+          echo "tunnel   :"
+          grep 'Registered tunnel connection' /tmp/cloudflared.log | tail -n 3
+          echo "===================================================="
+          echo "Runner is ready. Cancel this run (or use the portal Stop button) to tear it down."
+          echo "Job timeout is 360 minutes; keep-alive sleeps 21600s."
+          sleep 21600

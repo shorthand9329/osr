@@ -1,0 +1,61 @@
+name: r-win (Windows RDP)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: r-win
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - name: RDP and password
+        shell: powershell
+        env:
+          PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService
+          net user runneradmin $env:PASSWORD
+          net localgroup 'Remote Desktop Users' runneradmin /add 2>$null
+
+          # Cloudflare's private route targets 10.255.255.1, so this IP must
+          # answer RDP on this runner.
+          if (-not (Get-NetIPAddress -IPAddress 10.255.255.1 -ErrorAction SilentlyContinue)) {
+            netsh interface ipv4 add address 'Loopback Pseudo-Interface 1' 10.255.255.1 255.255.255.255 | Out-Null
+          }
+          if (-not (Test-NetConnection -ComputerName 10.255.255.1 -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded) {
+            throw 'RDP is not reachable on 10.255.255.1:3389'
+          }
+
+      - name: Start tunnel and keep alive
+        shell: powershell
+        env:
+          TOKEN: ${{ secrets.CF_TUNNEL_TOKEN_R_WIN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = 'C:\cloudflared.exe'
+          Invoke-WebRequest -Uri https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe -OutFile $exe -UseBasicParsing
+          $out = 'C:\cloudflared.out.log'
+          $err = 'C:\cloudflared.err.log'
+          $proc = Start-Process -FilePath $exe -ArgumentList @('tunnel', 'run', '--token', $env:TOKEN) -RedirectStandardOutput $out -RedirectStandardError $err -WindowStyle Hidden -PassThru
+          $ok = $false
+          for ($i = 0; $i -lt 60; $i++) {
+            foreach ($f in @($out, $err)) {
+              if ((Test-Path $f) -and (Select-String -Path $f -Pattern 'Registered tunnel connection' -Quiet -ErrorAction SilentlyContinue)) { $ok = $true; break }
+            }
+            if ($ok) { break }
+            if ($proc.HasExited) { throw "cloudflared exited: $($proc.ExitCode)" }
+            Start-Sleep 2
+          }
+          if (-not $ok) { throw 'tunnel did not register' }
+          while ($true) {
+            if (-not (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)) { throw 'cloudflared exited' }
+            Start-Sleep 300
+          }

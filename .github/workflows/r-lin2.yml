@@ -1,0 +1,61 @@
+name: r-lin2 (Linux SSH)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: r-lin2
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Prepare SSH and users
+        shell: bash
+        env:
+          CF_CA: ${{ secrets.CF_CA_R_LIN2 }}
+          SSO_USERS: ${{ vars.SSO_USERS }}
+          PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          sudo systemctl enable --now ssh
+          echo "runner:$PASSWORD" | sudo chpasswd
+
+          # Browser SSH authenticates with a Cloudflare short-lived certificate.
+          echo "$CF_CA" | sudo tee /etc/ssh/cloudflare-ca.pub >/dev/null
+          printf 'PubkeyAuthentication yes\nPasswordAuthentication no\nTrustedUserCAKeys /etc/ssh/cloudflare-ca.pub\n' \
+            | sudo tee /etc/ssh/sshd_config.d/99-cloudflare.conf >/dev/null
+          sudo systemctl reload ssh
+
+          # Every browser session lands on the shared runner account.
+          printf '#!/bin/bash\nexec sudo -iu runner\n' | sudo tee /usr/local/sbin/cloudflare-shell >/dev/null
+          sudo chmod 755 /usr/local/sbin/cloudflare-shell
+          grep -qxF /usr/local/sbin/cloudflare-shell /etc/shells || echo /usr/local/sbin/cloudflare-shell | sudo tee -a /etc/shells >/dev/null
+          sudo groupadd -f cloudflare-sso
+          printf '%%cloudflare-sso ALL=(ALL) NOPASSWD: ALL\n' | sudo tee /etc/sudoers.d/cloudflare-sso >/dev/null
+          sudo chmod 440 /etc/sudoers.d/cloudflare-sso
+
+          # Cloudflare uses the Access email prefix as the SSH username, so those
+          # local accounts exist only to hand the session to runner.
+          for u in ${SSO_USERS//,/ }; do
+            id "$u" >/dev/null 2>&1 || sudo useradd -m -s /usr/local/sbin/cloudflare-shell -G cloudflare-sso "$u"
+            sudo usermod -s /usr/local/sbin/cloudflare-shell -aG cloudflare-sso "$u"
+            # Alias user -> sudo -> runner must work for the browser session.
+            test "$(sudo -u "$u" sudo -iu runner whoami)" = runner
+          done
+          sudo ss -ltn | grep -q ':22 '
+
+      - name: Start tunnel and keep alive
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.CF_TUNNEL_TOKEN_R_LIN2 }}
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /tmp/cloudflared
+          nohup /tmp/cloudflared tunnel run --token "$TOKEN" >/tmp/cloudflared.log 2>&1 &
+          for _ in $(seq 1 60); do grep -q 'Registered tunnel connection' /tmp/cloudflared.log && break; sleep 2; done
+          grep -q 'Registered tunnel connection' /tmp/cloudflared.log
+          sleep 21600
